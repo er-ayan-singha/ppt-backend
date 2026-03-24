@@ -7,8 +7,12 @@ const { execSync } = require('child_process');
 const cloudinary = require('../config/cloudinary');
 const Presentation = require('../models/Presentation');
 
+const UPLOADS_DIR = process.env.NODE_ENV === 'production'
+  ? '/tmp/uploads'
+  : path.join(__dirname, '../uploads');
+
 const upload = multer({
-  dest: path.join(__dirname, '../uploads/'),
+  dest: UPLOADS_DIR,
   fileFilter: (req, file, cb) => {
     const allowed = ['.ppt', '.pptx'];
     const ext = path.extname(file.originalname).toLowerCase();

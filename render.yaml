@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ppt-backend
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.0
+    disk:
+      name: uploads
+      mountPath: /opt/render/project/src/server/uploads
+      sizeGB: 1

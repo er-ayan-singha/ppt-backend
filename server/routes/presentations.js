@@ -7,9 +7,6 @@ const { execSync } = require('child_process');
 const cloudinary = require('../config/cloudinary');
 const Presentation = require('../models/Presentation');
 
-const SOFFICE = 'C:\\Program Files\\LibreOffice\\program\\soffice.exe';
-const PDFTOPPM = 'C:\\Users\\aditi\\AppData\\Local\\Microsoft\\WinGet\\Packages\\oschwartz10612.Poppler_Microsoft.Winget.Source_8wekyb3d8bbwe\\poppler-25.07.0\\Library\\bin\\pdftoppm.exe';
-
 const upload = multer({
   dest: path.join(__dirname, '../uploads/'),
   fileFilter: (req, file, cb) => {
@@ -20,6 +17,17 @@ const upload = multer({
   },
   limits: { fileSize: 50 * 1024 * 1024 },
 });
+
+// Check if conversion tools are available
+const hasConversionTools = () => {
+  try {
+    execSync('soffice --version', { stdio: 'ignore' });
+    execSync('pdftoppm -v', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 // GET all presentations
 router.get('/', async (req, res) => {
@@ -48,65 +56,71 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 
   const tempPath = req.file.path;
   const originalName = req.file.originalname;
-  // Give it the proper extension so LibreOffice recognises it
   const pptxPath = tempPath + path.extname(originalName).toLowerCase();
   fs.renameSync(tempPath, pptxPath);
 
-  const slideDir = pptxPath + '_slides';
-  fs.mkdirSync(slideDir, { recursive: true });
-
   try {
-    // 1. Convert PPTX → PDF using LibreOffice
-    console.log('Converting PPTX to PDF...');
-    execSync(
-      `"${SOFFICE}" --headless --convert-to pdf --outdir "${slideDir}" "${pptxPath}"`,
-      { timeout: 120000 }
-    );
-
-    const pdfFiles = fs.readdirSync(slideDir).filter((f) => f.toLowerCase().endsWith('.pdf'));
-    if (pdfFiles.length === 0) throw new Error('LibreOffice failed to produce a PDF');
-    const pdfPath = path.join(slideDir, pdfFiles[0]);
-    console.log('PDF created:', pdfPath);
-
-    // 2. Split PDF into per-page PNGs using pdftoppm
-    const pngPrefix = path.join(slideDir, 'slide');
-    execSync(`"${PDFTOPPM}" -r 150 -png "${pdfPath}" "${pngPrefix}"`, { timeout: 120000 });
-
-    // Collect sorted slide files
-    let slideFiles = fs.readdirSync(slideDir)
-      .filter((f) => f.toLowerCase().endsWith('.png'))
-      .sort()
-      .map((f) => path.join(slideDir, f));
-
-    console.log(`Generated ${slideFiles.length} slide image(s):`, slideFiles.map(f => path.basename(f)));
-    if (slideFiles.length === 0) throw new Error('No slide images were generated');
-
-    // 2. Upload each slide image to Cloudinary
-    const slideUrls = [];
-    const timestamp = Date.now();
-    for (let i = 0; i < slideFiles.length; i++) {
-      const result = await cloudinary.uploader.upload(slideFiles[i], {
-        folder: 'presentations/slides',
-        public_id: `${timestamp}_slide_${i + 1}`,
-        resource_type: 'image',
-      });
-      slideUrls.push(result.secure_url);
-    }
-
-    // 3. Upload original PPTX as raw for download
+    // Upload original PPTX to Cloudinary
+    const ext = path.extname(originalName).toLowerCase().replace('.', '');
     const rawResult = await cloudinary.uploader.upload(pptxPath, {
       resource_type: 'raw',
       folder: 'presentations/originals',
-      public_id: `${timestamp}_${path.parse(originalName).name}.pptx`,
+      public_id: `${Date.now()}_${path.parse(originalName).name}.${ext}`,
     });
 
-    // 4. Save to MongoDB
+    let slideUrls = [];
+
+    // Try to convert if tools are available
+    if (hasConversionTools()) {
+      console.log('Converting PPTX to slide images...');
+      const slideDir = pptxPath + '_slides';
+      fs.mkdirSync(slideDir, { recursive: true });
+
+      try {
+        // Convert to PDF
+        execSync(`soffice --headless --convert-to pdf --outdir "${slideDir}" "${pptxPath}"`, { timeout: 120000 });
+        const pdfFiles = fs.readdirSync(slideDir).filter((f) => f.toLowerCase().endsWith('.pdf'));
+        
+        if (pdfFiles.length > 0) {
+          const pdfPath = path.join(slideDir, pdfFiles[0]);
+          const pngPrefix = path.join(slideDir, 'slide');
+          execSync(`pdftoppm -r 150 -png "${pdfPath}" "${pngPrefix}"`, { timeout: 120000 });
+
+          const slideFiles = fs.readdirSync(slideDir)
+            .filter((f) => f.toLowerCase().endsWith('.png'))
+            .sort()
+            .map((f) => path.join(slideDir, f));
+
+          console.log(`Generated ${slideFiles.length} slide(s)`);
+
+          // Upload each slide to Cloudinary
+          const timestamp = Date.now();
+          for (let i = 0; i < slideFiles.length; i++) {
+            const result = await cloudinary.uploader.upload(slideFiles[i], {
+              folder: 'presentations/slides',
+              public_id: `${timestamp}_slide_${i + 1}`,
+              resource_type: 'image',
+            });
+            slideUrls.push(result.secure_url);
+          }
+        }
+
+        // Cleanup
+        fs.rmSync(slideDir, { recursive: true, force: true });
+      } catch (convErr) {
+        console.warn('Conversion failed, using Office Online fallback:', convErr.message);
+      }
+    } else {
+      console.log('Conversion tools not available — using Office Online viewer');
+    }
+
+    // Save to MongoDB
     const presentation = new Presentation({
       title: req.body.title || path.parse(originalName).name,
       originalName,
       cloudinaryUrl: rawResult.secure_url,
       cloudinaryPublicId: rawResult.public_id,
-      slides: slideUrls,
+      slides: slideUrls, // Empty if conversion failed — frontend will use Office Online
     });
     await presentation.save();
 
@@ -114,9 +128,7 @@ router.post('/upload', upload.single('file'), async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
-    // Cleanup temp files
     if (fs.existsSync(pptxPath)) fs.unlinkSync(pptxPath);
-    if (fs.existsSync(slideDir)) fs.rmSync(slideDir, { recursive: true, force: true });
   }
 });
 
